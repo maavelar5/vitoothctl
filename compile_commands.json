@@ -1,0 +1,7 @@
+[
+    {
+        "directory": "/home/marco/bluetoothclient/",
+        "file": "main.cc",
+        "arguments": ["clang++", "-I/usr/include/SDL2/",  "main.cc"]
+    }
+]
