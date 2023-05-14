@@ -1,11 +1,14 @@
 #include "SDL.h"
 #include "SDL_ttf.h"
 
+#include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
 
 #include <iostream>
 #include <vector>
+
+#include <string>
 
 using std::string;
 using std::vector;
@@ -140,6 +143,25 @@ void parseOutput (vector<Entry> &entries, vector<string> &devices)
             devices.push_back (s);
     }
 
+    for (auto s = devices.begin (); s != devices.end ();)
+    {
+        bool found = false;
+
+        for (auto s2 : newDevices)
+        {
+            if (*s == s2)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+            s = devices.erase (s);
+        else
+            s++;
+    }
+
     entries.clear ();
 
     for (auto s : devices)
@@ -218,31 +240,102 @@ struct Panel
         {
             for (auto s : e)
             {
+                if (rect.x > (region.x + region.w) - fontW)
+                    break;
                 SDL_RenderCopy (renderer, glyph (renderer, s), NULL, &rect);
                 rect.x += fontW;
             }
 
             rect.x = region.x;
             rect.y += fontH;
+
+            if (rect.y > (region.y + region.h) - fontH)
+                break;
         }
     }
 };
 
-TTF_Font *getFont (int size)
+TTF_Font *getFont (string fontPath, int size)
 {
-    TTF_Font *font = TTF_OpenFont (
-        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf", size);
-
+    TTF_Font *font = TTF_OpenFont (fontPath.c_str (), size);
     TTF_SizeText (font, "a", &fontW, &fontH);
-
     return font;
 }
 
+SDL_cond  *cond;
+SDL_mutex *mutex;
+
 int scanOnFunction (void *data)
 {
-    system ("bluetoothctl scan on");
+    SDL_LockMutex (mutex);
+
+    char buffer;
+
+    string pid   = "btcl" + std::to_string (getpid ()),
+           cmd   = "exec -a '" + pid + "' bluetoothctl scan on",
+           pgrep = "pgrep -f " + pid;
+
+    popen (cmd.c_str (), "r");
+
+    FILE  *pipe    = popen (pgrep.c_str (), "r");
+    string message = "kill ";
+
+    while (read (fileno (pipe), &buffer, 1) > 0)
+        message += buffer;
+
+    pclose (pipe);
+
+    if (message.length () < 1)
+        exit (1);
+
+    SDL_CondWait (cond, mutex);
+
+    system (message.c_str ());
 
     return 0;
+}
+
+char *fileRead (const char *filename)
+{
+    SDL_RWops *rw = SDL_RWFromFile (filename, "rb");
+    if (rw == NULL)
+        return NULL;
+
+    Sint64 res_size = SDL_RWsize (rw);
+    char  *res      = (char *)malloc (res_size + 1);
+
+    Sint64 nb_read_total = 0, nb_read = 1;
+    char  *buf = res;
+    while (nb_read_total < res_size && nb_read != 0)
+    {
+        nb_read = SDL_RWread (rw, buf, 1, (res_size - nb_read_total));
+        nb_read_total += nb_read;
+        buf += nb_read;
+    }
+    SDL_RWclose (rw);
+    if (nb_read_total != res_size)
+    {
+        free (res);
+        return NULL;
+    }
+
+    res[nb_read_total] = '\0';
+    return res;
+}
+
+void saveConfig (string fontPath, int fontSize, int wX, int wY)
+{
+    string toWrite = std::to_string (fontSize) + "\n" + fontPath + "\n"
+                     + std::to_string (wX) + "\n" + std::to_string (wY) + "\n";
+
+    SDL_RWops *rw = SDL_RWFromFile ("config", "w");
+
+    if (!rw)
+        return;
+
+    SDL_RWwrite (rw, toWrite.c_str (), sizeof (char) * toWrite.length (), 1);
+
+    SDL_RWclose (rw);
 }
 
 int main (int argc, char **argv)
@@ -254,6 +347,9 @@ int main (int argc, char **argv)
 
     TTF_Init ();
 
+    cond  = SDL_CreateCond ();
+    mutex = SDL_CreateMutex ();
+
     SDL_Window *window = SDL_CreateWindow ("bluetoothclient", 0, 0, 640, 360,
                                            SDL_WINDOW_SHOWN);
 
@@ -262,12 +358,43 @@ int main (int argc, char **argv)
 
     SDL_RenderSetLogicalSize (renderer, 640, 360);
 
-    int fontSize = 12;
-    font         = getFont (fontSize);
+    int         linum = 0, fontSize = 12, wX = 0, wY = 0, offset = 0;
+    string      fontPath  = "";
+    const char *configRaw = fileRead ("config");
 
-    bool      run = true;
-    SDL_Event event;
+    for (int i = 0; configRaw[i]; i++)
+    {
+        string result = "";
 
+        while (configRaw[i] != '\n' && configRaw[i])
+            result += configRaw[i++];
+
+        std::cout << result << std::endl;
+
+        if (linum != 1)
+        {
+            int conv = std::stoi (result);
+
+            if (linum == 0)
+                fontSize = conv;
+            else if (linum == 2)
+                wX = conv;
+            else if (linum == 3)
+                wY = conv;
+        }
+        else
+        {
+            fontPath = result;
+        }
+
+        linum++;
+        offset = i;
+    }
+
+    font = getFont (fontPath, fontSize);
+
+    bool           run = true;
+    SDL_Event      event;
     vector<Entry>  entries;
     vector<string> devices, message;
 
@@ -290,6 +417,7 @@ int main (int argc, char **argv)
         { 0, 0, 480, 180 },
         { 255, 255, 255, 255 },
         { 128, 64, 10, 100 },
+        { 0, 0 },
     };
 
     Panel optionsPanel = {
@@ -297,6 +425,7 @@ int main (int argc, char **argv)
         { 480, 0, 160, 180 },
         { 255, 255, 255, 255 },
         { 64, 128, 10, 100 },
+        { 0, 0 },
     };
 
     Panel messagePanel = {
@@ -304,9 +433,10 @@ int main (int argc, char **argv)
         { 0, 180, 640, 180 },
         { 255, 255, 255, 255 },
         { 10, 128, 128, 100 },
+        { 0, 0 },
     };
 
-    SDL_SetWindowPosition (window, 640, 30);
+    SDL_SetWindowPosition (window, wX, wY);
 
     SDL_Thread *scanOnThread
         = SDL_CreateThread (scanOnFunction, "scanOnThread", nullptr);
@@ -326,17 +456,21 @@ int main (int argc, char **argv)
             switch (event.type)
             {
                 case SDL_QUIT: run = false; break;
-                case SDL_TEXTINPUT:
-                    if (event.text.text[0] == '=')
+                case SDL_WINDOWEVENT:
+                    switch (event.window.event)
                     {
-                        free (font);
-                        font = getFont (++fontSize);
-                    }
+                        case SDL_WINDOWEVENT_MOVED:
+                            SDL_GetWindowPosition (window, &wX, &wY);
 
+                            saveConfig (fontPath, fontSize, wX, wY);
+
+                            break;
+                    }
                     break;
                 case SDL_KEYDOWN:
                     switch (event.key.keysym.sym)
                     {
+                        case SDLK_q: run = false; break;
                         case SDLK_j:
                             switch (section)
                             {
@@ -364,23 +498,60 @@ int main (int argc, char **argv)
                             if (section == DEVICE)
                                 section = OPTION;
                             else if (section == OPTION)
+                            {
                                 message = messageOutput (
                                     options[optionsPanel.cursor.y],
                                     entries[devicePanel.cursor.y].macAddr);
 
+                                if (options[optionsPanel.cursor.y] == "remove")
+                                {
+                                    section              = DEVICE;
+                                    devicePanel.cursor.y = optionsPanel.cursor.y
+                                        = 0;
+                                }
+                            }
                             break;
-
                         case SDLK_l:
                             if (section == DEVICE)
                                 section = OPTION;
                             else if (section == OPTION)
+                            {
                                 message = messageOutput (
                                     options[optionsPanel.cursor.y],
                                     entries[devicePanel.cursor.y].macAddr);
 
+                                if (options[optionsPanel.cursor.y] == "remove")
+                                {
+                                    section              = DEVICE;
+                                    devicePanel.cursor.y = optionsPanel.cursor.y
+                                        = 0;
+                                }
+                            }
+                            break;
+                        case SDLK_EQUALS:
+                            free (font);
+                            font = getFont (fontPath, ++fontSize);
+
+                            saveConfig (fontPath, fontSize, wX, wY);
+
+                            for (int i = 0; i < textures.size (); i++)
+                                textures[i] = nullptr;
+
+                            break;
+                        case SDLK_MINUS:
+                            if (fontSize < 8)
+                                break;
+
+                            free (font);
+                            font = getFont (fontPath, --fontSize);
+
+                            saveConfig (fontPath, fontSize, wX, wY);
+
+                            for (int i = 0; i < textures.size (); i++)
+                                textures[i] = nullptr;
+
                             break;
                     }
-
                     break;
             }
         }
@@ -398,6 +569,9 @@ int main (int argc, char **argv)
 
         SDL_RenderPresent (renderer);
     }
+
+    SDL_CondSignal (cond);
+    SDL_WaitThread (scanOnThread, nullptr);
 
     SDL_Quit ();
 
