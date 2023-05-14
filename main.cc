@@ -9,9 +9,34 @@
 #include <vector>
 
 #include <string>
+#include <cassert>
 
 using std::string;
 using std::vector;
+
+#define sdlerr(Data)                                            \
+    if (Data == NULL)                                           \
+    {                                                           \
+        std::cout << "ERROR: " << SDL_GetError () << std::endl; \
+        exit (1);                                               \
+    }
+
+vector<string> runCmd (const string cmd, const string op)
+{
+    vector<string> result { "" };
+    char           buffer;
+    FILE          *pipe = popen (cmd.c_str (), op.c_str ());
+
+    while (read (fileno (pipe), &buffer, 1) > 0)
+        if (buffer == '\n')
+            result.push_back ("");
+        else
+            result.back () += buffer;
+
+    pclose (pipe);
+
+    return result;
+}
 
 int findWord (const std::string str, const std::string substr, int curr = 0)
 {
@@ -107,28 +132,16 @@ SDL_Texture *glyph (SDL_Renderer *renderer, Uint32 c)
 void parseOutput (vector<Entry> &entries, vector<string> &devices)
 {
     char           currSymbol = 'a';
-    vector<string> newDevices { "" };
-
-    FILE *handle = popen ("bluetoothctl devices", "r");
-
-    char buff;
-
-    while (read (fileno (handle), &buff, 1) > 0)
-    {
-        if (buff == '\n')
-            newDevices.push_back (string { "" });
-        else
-            newDevices.back () += buff;
-    }
-
-    pclose (handle);
+    vector<string> newDevices = runCmd ("bluetoothctl devices", "r");
 
     if (newDevices.back ().length () == 0)
         newDevices.pop_back ();
 
-    for (auto s : newDevices)
+    for (auto &s : newDevices)
     {
         bool found = false;
+
+        s = s.substr (string ("Device ").length ());
 
         for (auto s2 : devices)
         {
@@ -156,10 +169,7 @@ void parseOutput (vector<Entry> &entries, vector<string> &devices)
             }
         }
 
-        if (!found)
-            s = devices.erase (s);
-        else
-            s++;
+        s = (!found) ? devices.erase (s) : s + 1;
     }
 
     entries.clear ();
@@ -180,23 +190,7 @@ void parseOutput (vector<Entry> &entries, vector<string> &devices)
 
 vector<string> messageOutput (string option, string macAddr)
 {
-    char           buff;
-    string         result = "bluetoothctl " + option + " " + macAddr;
-    vector<string> message { "" };
-
-    FILE *thing = popen (result.c_str (), "r");
-
-    while (read (fileno (thing), &buff, 1) > 0)
-    {
-        if (buff == '\n')
-            message.push_back ("");
-        else
-            message.back () += buff;
-    }
-
-    pclose (thing);
-
-    return message;
+    return runCmd ("bluetoothctl " + option + " " + macAddr, "r");
 }
 
 int fontW, fontH;
@@ -255,13 +249,6 @@ struct Panel
     }
 };
 
-TTF_Font *getFont (string fontPath, int size)
-{
-    TTF_Font *font = TTF_OpenFont (fontPath.c_str (), size);
-    TTF_SizeText (font, "a", &fontW, &fontH);
-    return font;
-}
-
 SDL_cond  *cond;
 SDL_mutex *mutex;
 
@@ -269,28 +256,26 @@ int scanOnFunction (void *data)
 {
     SDL_LockMutex (mutex);
 
-    char buffer;
-
     string pid   = "btcl" + std::to_string (getpid ()),
            cmd   = "exec -a '" + pid + "' bluetoothctl scan on",
            pgrep = "pgrep -f " + pid;
 
     popen (cmd.c_str (), "r");
 
-    FILE  *pipe    = popen (pgrep.c_str (), "r");
-    string message = "kill ";
+    vector<string> pids = runCmd (pgrep.c_str (), "r");
 
-    while (read (fileno (pipe), &buffer, 1) > 0)
-        message += buffer;
+    if (pids.back ().length () == 0)
+        pids.pop_back ();
 
-    pclose (pipe);
+    string message = "";
 
-    if (message.length () < 1)
-        exit (1);
+    for (auto str : pids)
+        message += "kill " + str + ";";
 
     SDL_CondWait (cond, mutex);
 
-    system (message.c_str ());
+    if (message.length () > 0)
+        system (message.c_str ());
 
     return 0;
 }
@@ -323,75 +308,118 @@ char *fileRead (const char *filename)
     return res;
 }
 
-void saveConfig (string fontPath, int fontSize, int wX, int wY)
+string getHome ()
 {
-    string toWrite = std::to_string (fontSize) + "\n" + fontPath + "\n"
-                     + std::to_string (wX) + "\n" + std::to_string (wY) + "\n";
+    vector<string> result = runCmd ("echo $HOME", "r");
 
-    SDL_RWops *rw = SDL_RWFromFile ("config", "w");
+    assert (result[0].length () > 0);
 
-    if (!rw)
-        return;
-
-    SDL_RWwrite (rw, toWrite.c_str (), sizeof (char) * toWrite.length (), 1);
-
-    SDL_RWclose (rw);
+    return result[0];
 }
+
+struct Config
+{
+    string path, fontPath;
+    int    fontSize, wX, wY;
+
+    void save ()
+    {
+        string toWrite = std::to_string (fontSize) + "\n" + fontPath + "\n"
+                         + std::to_string (wX) + "\n" + std::to_string (wY)
+                         + "\n";
+
+        SDL_RWops *rw = SDL_RWFromFile (path.c_str (), "w");
+
+        assert (rw != NULL);
+
+        SDL_RWwrite (rw, toWrite.c_str (), sizeof (char) * toWrite.length (),
+                     1);
+
+        SDL_RWclose (rw);
+    }
+
+    TTF_Font *getFont ()
+    {
+        TTF_Font *font = TTF_OpenFont (fontPath.c_str (), fontSize);
+
+        sdlerr (font);
+
+        TTF_SizeText (font, "a", &fontW, &fontH);
+
+        return font;
+    }
+};
 
 int main (int argc, char **argv)
 {
+    string HOMEDIR = getHome ();
+
+    Config config {
+        HOMEDIR + "/.config/vitoothconfig",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        12,
+        0,
+        0,
+    };
+
     for (int i = 0; i < textures.size (); i++)
         textures[i] = nullptr;
 
     SDL_Init (SDL_INIT_EVERYTHING);
-
     TTF_Init ();
-
     cond  = SDL_CreateCond ();
     mutex = SDL_CreateMutex ();
 
     SDL_Window *window = SDL_CreateWindow ("bluetoothclient", 0, 0, 640, 360,
                                            SDL_WINDOW_SHOWN);
 
+    sdlerr (window);
+
     SDL_Renderer *renderer = SDL_CreateRenderer (
         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
+    sdlerr (renderer);
+
     SDL_RenderSetLogicalSize (renderer, 640, 360);
 
-    int         linum = 0, fontSize = 12, wX = 0, wY = 0, offset = 0;
-    string      fontPath  = "";
-    const char *configRaw = fileRead ("config");
+    int linum = 0;
 
-    for (int i = 0; configRaw[i]; i++)
+    const char *configRaw = fileRead (config.path.c_str ());
+
+    if (configRaw == NULL)
     {
-        string result = "";
-
-        while (configRaw[i] != '\n' && configRaw[i])
-            result += configRaw[i++];
-
-        std::cout << result << std::endl;
-
-        if (linum != 1)
+        system (string ("touch " + config.path).c_str ());
+    }
+    else
+    {
+        for (int i = 0; configRaw[i]; i++)
         {
-            int conv = std::stoi (result);
+            string result = "";
 
-            if (linum == 0)
-                fontSize = conv;
-            else if (linum == 2)
-                wX = conv;
-            else if (linum == 3)
-                wY = conv;
-        }
-        else
-        {
-            fontPath = result;
-        }
+            while (configRaw[i] != '\n' && configRaw[i])
+                result += configRaw[i++];
 
-        linum++;
-        offset = i;
+            if (linum != 1)
+            {
+                int conv = std::stoi (result);
+
+                if (linum == 0)
+                    config.fontSize = conv;
+                else if (linum == 2)
+                    config.wX = conv;
+                else if (linum == 3)
+                    config.wY = conv;
+            }
+            else
+            {
+                config.fontPath = result;
+            }
+
+            linum++;
+        }
     }
 
-    font = getFont (fontPath, fontSize);
+    font = config.getFont ();
 
     bool           run = true;
     SDL_Event      event;
@@ -436,7 +464,7 @@ int main (int argc, char **argv)
         { 0, 0 },
     };
 
-    SDL_SetWindowPosition (window, wX, wY);
+    SDL_SetWindowPosition (window, config.wX, config.wY);
 
     SDL_Thread *scanOnThread
         = SDL_CreateThread (scanOnFunction, "scanOnThread", nullptr);
@@ -449,6 +477,16 @@ int main (int argc, char **argv)
         {
             parseOutput (entries, devices);
             currTime = SDL_GetTicks ();
+
+            if (devices.size () > 0)
+            {
+                if (devices.size () - 1 < devicePanel.cursor.y)
+                    devicePanel.cursor.y = devices.size () - 1;
+            }
+            else
+            {
+                devicePanel.cursor.y = 0;
+            }
         }
 
         while (SDL_PollEvent (&event))
@@ -460,9 +498,10 @@ int main (int argc, char **argv)
                     switch (event.window.event)
                     {
                         case SDL_WINDOWEVENT_MOVED:
-                            SDL_GetWindowPosition (window, &wX, &wY);
+                            SDL_GetWindowPosition (window, &config.wX,
+                                                   &config.wY);
 
-                            saveConfig (fontPath, fontSize, wX, wY);
+                            config.save ();
 
                             break;
                     }
@@ -530,22 +569,23 @@ int main (int argc, char **argv)
                             break;
                         case SDLK_EQUALS:
                             free (font);
-                            font = getFont (fontPath, ++fontSize);
+                            config.fontSize++;
 
-                            saveConfig (fontPath, fontSize, wX, wY);
+                            font = config.getFont ();
+
+                            config.save ();
 
                             for (int i = 0; i < textures.size (); i++)
                                 textures[i] = nullptr;
 
                             break;
                         case SDLK_MINUS:
-                            if (fontSize < 8)
+                            if (config.fontSize < 8)
                                 break;
 
                             free (font);
-                            font = getFont (fontPath, --fontSize);
-
-                            saveConfig (fontPath, fontSize, wX, wY);
+                            config.fontSize--;
+                            font = config.getFont ();
 
                             for (int i = 0; i < textures.size (); i++)
                                 textures[i] = nullptr;
