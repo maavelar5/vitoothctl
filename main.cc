@@ -480,7 +480,7 @@ int main (int argc, char **argv)
 
             if (devices.size () > 0)
             {
-                if (devices.size () - 1 < devicePanel.cursor.y)
+                if (devicePanel.cursor.y > devices.size () - 1)
                     devicePanel.cursor.y = devices.size () - 1;
             }
             else
