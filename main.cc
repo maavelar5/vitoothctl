@@ -11,6 +11,8 @@
 #include <string>
 #include <cassert>
 
+#include <fcntl.h>
+
 using std::string;
 using std::vector;
 
@@ -129,7 +131,63 @@ SDL_Texture *glyph (SDL_Renderer *renderer, Uint32 c)
     return textures[c];
 }
 
-void parseOutput (vector<Entry> &entries, vector<string> &devices)
+void parseOutput (vector<Entry> &entries, vector<string> &devices,
+                  vector<string> newDevices)
+{
+    char currSymbol = 'a';
+
+    for (auto &s : newDevices)
+    {
+        bool found = false;
+
+        s = s.substr (string ("Device ").length ());
+
+        for (auto s2 : devices)
+        {
+            if (s == s2)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+            devices.push_back (s);
+    }
+
+    for (auto s = devices.begin (); s != devices.end ();)
+    {
+        bool found = false;
+
+        for (auto s2 : newDevices)
+        {
+            if (*s == s2)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        s = (!found) ? devices.erase (s) : s + 1;
+    }
+
+    entries.clear ();
+
+    for (auto s : devices)
+    {
+        int    deviceName = -1;
+        string macAddr    = findMacAddr (s, &deviceName);
+        string devName    = s.substr (deviceName);
+
+        entries.push_back (Entry {
+            currSymbol++,
+            macAddr,
+            devName,
+        });
+    }
+}
+
+void getDevices (vector<Entry> &entries, vector<string> &devices)
 {
     char           currSymbol = 'a';
     vector<string> newDevices = runCmd ("bluetoothctl devices", "r");
@@ -234,10 +292,17 @@ struct Panel
         {
             for (auto s : e)
             {
-                if (rect.x > (region.x + region.w) - fontW)
-                    break;
-                SDL_RenderCopy (renderer, glyph (renderer, s), NULL, &rect);
-                rect.x += fontW;
+                if (s >= 32 && s <= 126)
+                {
+                    // if (rect.x > (region.x + region.w) - fontW)
+                    // {
+                    // rect.x = region.x;
+                    // rect.y += fontH;
+                    // }
+
+                    SDL_RenderCopy (renderer, glyph (renderer, s), NULL, &rect);
+                    rect.x += fontW;
+                }
             }
 
             rect.x = region.x;
@@ -254,6 +319,8 @@ SDL_mutex *mutex;
 
 int scanOnFunction (void *data)
 {
+    return 0;
+
     SDL_LockMutex (mutex);
 
     string pid   = "btcl" + std::to_string (getpid ()),
@@ -350,6 +417,196 @@ struct Config
     }
 };
 
+struct AsyncData
+{
+    string     buffer, inputBuffer;
+    SDL_mutex *mutex, *inputMutex, *runningMutex;
+
+    int rpipes[2], wpipes[2];
+};
+
+bool findSubWordAtIndex (string str, string substr, int index)
+{
+    for (int i = index, j = 0;
+         i < str.length () && i + substr.length () - 1 < str.length ();
+         i++, j++)
+    {
+        if (str[i] != substr[j])
+            return false;
+
+        return true;
+    }
+
+    return false;
+}
+
+struct Filter
+{
+    string substring;
+    int    pos;
+};
+
+/**
+   @cmd appends \r automatically if not present as last character
+   @filter --
+**/
+vector<string> runCmdAndRead (AsyncData &ad, string cmd,
+                              Filter filter = { "", -1 })
+{
+    vector<string> result;
+
+    assert (cmd.length () > 1);
+
+    if (cmd.back () != '\r')
+        cmd += '\r';
+
+    write (ad.wpipes[1], cmd.c_str (), cmd.length ());
+
+    bool shouldFilter = (filter.substring.length ()) ? true : false;
+
+    SDL_LockMutex (ad.mutex);
+
+    if (ad.buffer.length () > 0)
+    {
+        string line = "";
+
+        for (auto c : ad.buffer)
+        {
+            if (c == '\n')
+            {
+                if (shouldFilter)
+                {
+                    if (findSubWordAtIndex (line, filter.substring, filter.pos))
+                        result.push_back (line);
+                }
+                else
+                {
+                    result.push_back (line);
+                }
+
+                line = "";
+            }
+            else
+            {
+                line += c;
+            }
+        }
+
+        ad.buffer = "";
+    }
+
+    SDL_UnlockMutex (ad.mutex);
+
+    return result;
+}
+
+/**
+   @cmd appends \r automatically if not present as last character
+   @filter --
+**/
+void runCmd (AsyncData &ad, string cmd)
+{
+    assert (cmd.length () > 1);
+
+    if (cmd.back () != '\r')
+        cmd += '\r';
+
+    SDL_LockMutex (ad.mutex);
+
+    write (ad.wpipes[1], cmd.c_str (), cmd.length ());
+
+    SDL_UnlockMutex (ad.mutex);
+}
+
+vector<string> output;
+
+void readOutput (AsyncData &ad)
+{
+    SDL_LockMutex (ad.mutex);
+
+    string line = "";
+
+    if (ad.buffer.length () > 0)
+    {
+        for (auto c : ad.buffer)
+        {
+            if (c == '\n')
+            {
+                output.push_back (line);
+                std::cout << line << std::endl;
+                line = "";
+            }
+            else
+            {
+                line += c;
+            }
+        }
+
+        ad.buffer = "";
+    }
+
+    SDL_UnlockMutex (ad.mutex);
+}
+
+int asyncLoop (void *voiddata)
+{
+    AsyncData *ad = (AsyncData *)voiddata;
+
+    // fork is needed since exec* functions replace the process image
+    if (fork () == 0)
+    {
+        close (ad->wpipes[1]);
+        close (ad->rpipes[0]);
+        dup2 (ad->wpipes[0], STDIN_FILENO);
+        dup2 (ad->rpipes[1], STDOUT_FILENO);
+        close (ad->wpipes[0]);
+        close (ad->rpipes[1]);
+
+        // execl ("/usr/bin/ping", "/usr/bin/ping", "www.google.com", NULL);
+        execl ("/usr/bin/bluetoothctl", "/usr/bin/bluetoothctl", NULL);
+
+        exit (0);
+    }
+
+    close (ad->wpipes[0]);
+    close (ad->rpipes[1]);
+
+    string data = "scan on\r";
+
+    write (ad->wpipes[1], data.c_str (), data.length ());
+
+    int    status = 1;
+    char   c;
+    string buffer;
+
+    fcntl (ad->rpipes[0], F_SETFL, O_NONBLOCK);
+
+    while (status)
+    {
+        SDL_Delay (1000);
+
+        SDL_LockMutex (ad->mutex);
+
+        do
+        {
+            status = read (ad->rpipes[0], &c, 1);
+
+            if (status > 0)
+                buffer += c;
+        } while (status > 0);
+
+        if (buffer.length ())
+        {
+            ad->buffer = buffer;
+            buffer     = "";
+        }
+
+        SDL_UnlockMutex (ad->mutex);
+    }
+
+    return 0;
+}
+
 int main (int argc, char **argv)
 {
     string HOMEDIR = getHome ();
@@ -367,6 +624,19 @@ int main (int argc, char **argv)
 
     SDL_Init (SDL_INIT_EVERYTHING);
     TTF_Init ();
+
+    AsyncData ad = {
+        "", "", SDL_CreateMutex (), SDL_CreateMutex (), SDL_CreateMutex (),
+    };
+
+    pipe (ad.rpipes);
+    pipe (ad.wpipes);
+
+    SDL_LockMutex (ad.runningMutex);
+
+    SDL_Thread *asyncLoopThread
+        = SDL_CreateThread (asyncLoop, "asyncLoop", &ad);
+
     cond  = SDL_CreateCond ();
     mutex = SDL_CreateMutex ();
 
@@ -426,7 +696,7 @@ int main (int argc, char **argv)
     vector<Entry>  entries;
     vector<string> devices, message;
 
-    parseOutput (entries, devices);
+    getDevices (entries, devices);
 
     vector<string> options = {
         "connect", "disconnect", "remove", "trust", "pair",
@@ -475,7 +745,7 @@ int main (int argc, char **argv)
     {
         if (SDL_GetTicks () - currTime > 1000)
         {
-            parseOutput (entries, devices);
+            getDevices (entries, devices);
             currTime = SDL_GetTicks ();
 
             if (devices.size () > 0)
@@ -538,9 +808,11 @@ int main (int argc, char **argv)
                                 section = OPTION;
                             else if (section == OPTION)
                             {
-                                message = messageOutput (
-                                    options[optionsPanel.cursor.y],
-                                    entries[devicePanel.cursor.y].macAddr);
+                                string parse
+                                    = options[optionsPanel.cursor.y] + " "
+                                      + entries[devicePanel.cursor.y].macAddr;
+
+                                runCmd (ad, parse);
 
                                 if (options[optionsPanel.cursor.y] == "remove")
                                 {
@@ -604,14 +876,29 @@ int main (int argc, char **argv)
         if (section == OPTION)
             optionsPanel.draw (options, renderer);
 
-        if (message.size ())
-            messagePanel.draw (message, renderer);
+        if (output.size ())
+            messagePanel.draw (output, renderer);
 
         SDL_RenderPresent (renderer);
+
+        //     SDL_LockMutex (ad.mutex);
+
+        //     if (ad.buffer.length () > 0)
+        //         ad.buffer = "";
+
+        //     SDL_UnlockMutex (ad.mutex);
+
+        readOutput (ad);
     }
 
     SDL_CondSignal (cond);
     SDL_WaitThread (scanOnThread, nullptr);
+
+    string data = "exit\r";
+    write (ad.wpipes[1], data.c_str (), data.length ());
+
+    SDL_UnlockMutex (ad.runningMutex);
+    SDL_WaitThread (asyncLoopThread, nullptr);
 
     SDL_Quit ();
 
